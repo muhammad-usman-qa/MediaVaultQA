@@ -1,0 +1,6 @@
+<Solution>
+  <Project Path="MediaVault.API/MediaVault.API.csproj" />
+  <Project Path="MediaVault.E2ETests/MediaVault.E2ETests.csproj" />
+  <Project Path="MediaVault.IntegrationTests/MediaVault.IntegrationTests.csproj" />
+  <Project Path="MediaVault.UnitTests/MediaVault.UnitTests.csproj" />
+</Solution>

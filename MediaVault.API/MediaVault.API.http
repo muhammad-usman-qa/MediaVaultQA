@@ -1,0 +1,6 @@
+@MediaVault.API_HostAddress = http://localhost:5232
+
+GET {{MediaVault.API_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

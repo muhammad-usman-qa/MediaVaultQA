@@ -1,0 +1,297 @@
+name: MediaVault QA Pipeline
+
+on:
+  push:
+    branches: [ main, develop, "feature/**" ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  DOTNET_VERSION: '10.x'
+  COVERAGE_THRESHOLD: 80
+
+jobs:
+  # ── Job 1: Build ─────────────────────────────────────────────────────────
+  build:
+    name: Build Solution
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore MediaVaultQA.slnx
+
+      - name: Build solution
+        run: dotnet build MediaVaultQA.slnx --no-restore --configuration Release
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            **/bin/Release/
+          retention-days: 1
+
+  # ── Job 2: Unit Tests ────────────────────────────────────────────────────
+  unit-tests:
+    name: Unit Tests (xUnit + Moq + FluentAssertions)
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore MediaVault.UnitTests/MediaVault.UnitTests.csproj
+
+      - name: Run unit tests with coverage
+        run: |
+          dotnet test MediaVault.UnitTests/MediaVault.UnitTests.csproj \
+            --configuration Release \
+            --no-restore \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults/UnitTests \
+            --logger "trx;LogFileName=unit-tests.trx" \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+
+      - name: Install ReportGenerator
+        run: dotnet tool install --global dotnet-reportgenerator-globaltool
+
+      - name: Generate coverage report
+        run: |
+          reportgenerator \
+            -reports:"./TestResults/UnitTests/**/coverage.cobertura.xml" \
+            -targetdir:"./TestResults/UnitTests/CoverageReport" \
+            -reporttypes:"Html;TextSummary;Cobertura"
+
+      - name: Check coverage threshold
+        run: |
+          SUMMARY="./TestResults/UnitTests/CoverageReport/Summary.txt"
+          if [ ! -f "$SUMMARY" ]; then
+            echo "::error::Coverage summary not found"
+            exit 1
+          fi
+          cat "$SUMMARY"
+          COVERAGE=$(grep -oP 'Line coverage: \K[0-9.]+' "$SUMMARY" | head -1)
+          echo "Line coverage: ${COVERAGE}%"
+          python3 -c "
+          import sys
+          coverage = float('${COVERAGE}')
+          threshold = ${{ env.COVERAGE_THRESHOLD }}
+          if coverage < threshold:
+              print(f'::error::Coverage {coverage:.1f}% is below the {threshold}% threshold')
+              sys.exit(1)
+          else:
+              print(f'Coverage {coverage:.1f}% meets the {threshold}% threshold')
+          "
+
+      - name: Upload unit test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: unit-test-results
+          path: |
+            ./TestResults/UnitTests/**/*.trx
+            ./TestResults/UnitTests/CoverageReport/
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Unit Test Results
+          path: './TestResults/UnitTests/**/*.trx'
+          reporter: dotnet-trx
+
+  # ── Job 3: Integration Tests ─────────────────────────────────────────────
+  integration-tests:
+    name: Integration Tests (WireMock.NET + WebApplicationFactory)
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore MediaVault.IntegrationTests/MediaVault.IntegrationTests.csproj
+
+      - name: Run integration tests with coverage
+        run: |
+          dotnet test MediaVault.IntegrationTests/MediaVault.IntegrationTests.csproj \
+            --configuration Release \
+            --no-restore \
+            --collect:"XPlat Code Coverage" \
+            --results-directory ./TestResults/IntegrationTests \
+            --logger "trx;LogFileName=integration-tests.trx" \
+            -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=cobertura
+
+      - name: Upload integration test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: integration-test-results
+          path: ./TestResults/IntegrationTests/
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Integration Test Results
+          path: './TestResults/IntegrationTests/**/*.trx'
+          reporter: dotnet-trx
+
+  # ── Job 4: E2E Tests ─────────────────────────────────────────────────────
+  e2e-tests:
+    name: E2E Tests (Playwright)
+    runs-on: ubuntu-latest
+    needs: integration-tests
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore MediaVaultQA.slnx
+
+      - name: Build E2E test project
+        run: dotnet build MediaVault.E2ETests/MediaVault.E2ETests.csproj --configuration Release --no-restore
+
+      - name: Install Playwright browsers
+        run: pwsh MediaVault.E2ETests/bin/Release/net10.0/playwright.ps1 install --with-deps chromium
+
+      - name: Run E2E tests
+        run: |
+          dotnet test MediaVault.E2ETests/MediaVault.E2ETests.csproj \
+            --configuration Release \
+            --no-restore \
+            --results-directory ./TestResults/E2ETests \
+            --logger "trx;LogFileName=e2e-tests.trx"
+        env:
+          # Leave unset to use in-process WebApplicationFactory (no separate server needed)
+          # Set API_BASE_URL to target a deployed environment
+          # API_BASE_URL: https://staging.mediavault.com
+
+      - name: Upload E2E test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-test-results
+          path: ./TestResults/E2ETests/
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: E2E Test Results
+          path: './TestResults/E2ETests/**/*.trx'
+          reporter: dotnet-trx
+
+  # ── Job 5: Combined Coverage Gate ────────────────────────────────────────
+  coverage-gate:
+    name: Combined Coverage Gate (${{ env.COVERAGE_THRESHOLD }}% threshold)
+    runs-on: ubuntu-latest
+    needs: [ unit-tests, integration-tests ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Download unit test coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: unit-test-results
+          path: ./AllCoverage/UnitTests
+
+      - name: Download integration test coverage
+        uses: actions/download-artifact@v4
+        with:
+          name: integration-test-results
+          path: ./AllCoverage/IntegrationTests
+
+      - name: Install ReportGenerator
+        run: dotnet tool install --global dotnet-reportgenerator-globaltool
+
+      - name: Merge and generate combined coverage report
+        run: |
+          reportgenerator \
+            -reports:"./AllCoverage/**/coverage.cobertura.xml" \
+            -targetdir:"./AllCoverage/CombinedReport" \
+            -reporttypes:"Html;TextSummary;Badges;Cobertura" \
+            -title:"MediaVault QA Coverage"
+
+      - name: Enforce combined coverage threshold
+        run: |
+          SUMMARY="./AllCoverage/CombinedReport/Summary.txt"
+          cat "$SUMMARY"
+          COVERAGE=$(grep -oP 'Line coverage: \K[0-9.]+' "$SUMMARY" | head -1)
+          echo "Combined line coverage: ${COVERAGE}%"
+          python3 -c "
+          import sys
+          coverage = float('${COVERAGE}')
+          threshold = ${{ env.COVERAGE_THRESHOLD }}
+          print(f'Combined coverage: {coverage:.1f}% (threshold: {threshold}%)')
+          if coverage < threshold:
+              print(f'::error::Coverage {coverage:.1f}% is BELOW the required {threshold}% threshold')
+              sys.exit(1)
+          print(f'Coverage gate PASSED')
+          "
+
+      - name: Upload combined coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: combined-coverage-report
+          path: ./AllCoverage/CombinedReport/
+
+  # ── Job 6: Quality Summary ────────────────────────────────────────────────
+  quality-summary:
+    name: QA Quality Summary
+    runs-on: ubuntu-latest
+    needs: [ unit-tests, integration-tests, e2e-tests, coverage-gate ]
+    if: always()
+
+    steps:
+      - name: Post summary
+        run: |
+          echo "## MediaVault QA Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Unit Tests (xUnit + Moq + FluentAssertions) | ${{ needs.unit-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Integration Tests (WireMock.NET) | ${{ needs.integration-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| E2E Tests (Playwright) | ${{ needs.e2e-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Coverage Gate (${{ env.COVERAGE_THRESHOLD }}% threshold) | ${{ needs.coverage-gate.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "- 📊 Combined coverage HTML report" >> $GITHUB_STEP_SUMMARY
+          echo "- 📋 Unit test TRX results" >> $GITHUB_STEP_SUMMARY
+          echo "- 📋 Integration test TRX results" >> $GITHUB_STEP_SUMMARY
+          echo "- 📋 E2E test TRX results" >> $GITHUB_STEP_SUMMARY
